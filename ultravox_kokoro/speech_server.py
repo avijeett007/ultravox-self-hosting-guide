@@ -49,16 +49,22 @@ class VoiceAssistant:
         
         # Updated VAD parameters
         self.sample_rate = 16000
-        self.vad_frame_size = 512  # Silero VAD requires exactly 512 samples for 16kHz
-        self.speech_threshold = 0.5
-        self.min_speech_duration_ms = 250
-        self.min_silence_duration_ms = 400
+        self.vad_window_size = 1536  # Increased window size (96ms)
+        self.speech_threshold = 0.5   # Speech probability threshold
+        self.min_speech_duration_ms = 250  # Minimum speech duration in ms
+        self.min_silence_duration_ms = 400  # Minimum silence duration in ms
         
-        # Buffers
+        # New buffers
         self.audio_window = []
         self.speech_probs = []
         self.current_speech = []
-        self.frame_counter = 0
+        self.speech_timestamps = []
+        
+        # Buffers
+        self.vad_buffer = []
+        self.speech_buffer = []
+        self.is_speaking = False
+        self.speech_frames = 0
         self.silence_counter = 0
 
     def get_tts_pipeline(self, voice_name: str) -> KPipeline:
@@ -68,36 +74,35 @@ class VoiceAssistant:
         return self.tts_pipelines[voice_name]
 
     def is_speech(self, audio_chunk: np.ndarray) -> bool:
-        """VAD detection using proper frame size"""
+        """Improved VAD detection using sliding windows and averaging"""
         try:
             # Add chunk to audio window
             self.audio_window.extend(audio_chunk.tolist())
             
-            speech_detected = False
-            # Process complete frames of exactly 512 samples
-            while len(self.audio_window) >= self.vad_frame_size:
-                # Get frame of correct size
-                frame = np.array(self.audio_window[:self.vad_frame_size])
-                self.audio_window = self.audio_window[self.vad_frame_size:]
+            # Process complete windows
+            while len(self.audio_window) >= self.vad_window_size:
+                # Get window of correct size
+                window = np.array(self.audio_window[:self.vad_window_size])
+                self.audio_window = self.audio_window[self.vad_window_size:]
                 
-                # Prepare tensor for Silero VAD
-                tensor = torch.FloatTensor(frame).unsqueeze(0)
+                # Convert to tensor
+                tensor = torch.FloatTensor(window).unsqueeze(0)
                 
                 # Get speech probability
                 speech_prob = self.vad_model(tensor, self.sample_rate).item()
                 self.speech_probs.append(speech_prob)
                 
-                # Keep last 1 second of probabilities
-                max_probs = int(self.sample_rate / self.vad_frame_size)
-                if len(self.speech_probs) > max_probs:
-                    self.speech_probs = self.speech_probs[-max_probs:]
-                
-                # Use moving average for more stable detection
-                if len(self.speech_probs) >= 3:
-                    avg_prob = sum(self.speech_probs[-3:]) / 3
-                    speech_detected = speech_detected or avg_prob > self.speech_threshold
+                # Keep only recent probabilities (last 1 second)
+                window_size = int(self.sample_rate / self.vad_window_size)
+                if len(self.speech_probs) > window_size:
+                    self.speech_probs.pop(0)
             
-            return speech_detected
+            # Calculate moving average of speech probabilities
+            if not self.speech_probs:
+                return False
+                
+            avg_speech_prob = sum(self.speech_probs) / len(self.speech_probs)
+            return avg_speech_prob > self.speech_threshold
             
         except Exception as e:
             print(f"VAD error: {e}")
@@ -107,48 +112,40 @@ class VoiceAssistant:
         """Improved audio processing with better speech detection"""
         has_speech = self.is_speech(audio_chunk)
         
-        # Calculate duration of this chunk
+        # Calculate durations
         chunk_duration_ms = len(audio_chunk) * 1000 / self.sample_rate
         
         if has_speech:
             if not self.current_speech:  # Start of speech
                 print("Speech started...")
-                self.frame_counter = 0
             self.current_speech.extend(audio_chunk.tolist())
-            self.frame_counter += chunk_duration_ms
             self.silence_counter = 0
         else:
             if self.current_speech:  # Potential end of speech
                 self.silence_counter += chunk_duration_ms
-                # Keep some context around speech
                 self.current_speech.extend(audio_chunk.tolist())
-        
+            
         # Check if we should process the speech
         should_process = (
             len(self.current_speech) > 0 and
-            self.frame_counter >= self.min_speech_duration_ms and
+            len(self.current_speech) * 1000 / self.sample_rate >= self.min_speech_duration_ms and
             self.silence_counter >= self.min_silence_duration_ms
         )
         
         if should_process:
-            duration_ms = len(self.current_speech) * 1000 / self.sample_rate
-            print(f"Speech detected - duration: {duration_ms:.0f}ms")
+            print(f"Speech detected - duration: {len(self.current_speech) * 1000 / self.sample_rate:.0f}ms")
             self.audio_buffer = self.current_speech.copy()
             self.current_speech = []
-            self.frame_counter = 0
             self.silence_counter = 0
             self.speech_probs = []
             return True
-        
+            
         # Reset if silence is too long
         if self.silence_counter > self.min_silence_duration_ms * 2:
-            if len(self.current_speech) > 0:
-                print("Discarding too short speech segment")
             self.current_speech = []
-            self.frame_counter = 0
             self.silence_counter = 0
             self.speech_probs = []
-        
+            
         return False
 
     def get_audio(self) -> np.ndarray:
